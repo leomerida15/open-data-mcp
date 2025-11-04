@@ -16,7 +16,12 @@ import { getPortalInfo, PortalInfo } from "./utils/portal-info.js";
 // Global variables for server state
 let portalInfo: PortalInfo;
 let enhancedTools: Tool[];
-let mcpServer: Server;
+
+// Map to store active SSE transports by session ID
+const activeTransports = new Map<string, SSEServerTransport>();
+
+// Map to store active MCP servers by session ID
+const activeServers = new Map<string, Server>();
 
 // Enhanced tool with portal context
 function enhanceToolsWithPortalInfo(
@@ -137,12 +142,10 @@ async function setupServer(): Promise<void> {
         enhancedTools = enhanceToolsWithPortalInfo(SOCRATA_TOOLS, portalInfo);
         console.log(`[MCP] Enhanced ${enhancedTools.length} tool(s) with portal info`);
 
-        // Initialize the global MCP server instance
-        mcpServer = initializeServer();
-
         console.log(
             `[MCP] OpenGov MCP Server configured for data portal: ${portalInfo.title}`,
         );
+        console.log("[MCP] Ready to accept SSE connections. Each connection will get its own server instance.");
     } catch (error) {
         console.error("[MCP] Error during server setup:", error);
         if (error instanceof Error) {
@@ -165,36 +168,59 @@ app.use(express.json());
 
 // Handle SSE connection (GET request)
 app.get("/mcp", async (req: Request, res: Response) => {
-    console.log("[MCP] New SSE connection request received");
+    // Generate a unique session ID for this SSE connection
+    const sessionId = `session-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    
+    console.log(`[MCP] New SSE connection request received (Session: ${sessionId})`);
     
     try {
+        // Create a NEW MCP server instance for THIS session
+        console.log(`[MCP] Creating new MCP server instance for session ${sessionId}`);
+        const server = initializeServer();
+        
         // Create the SSE transport
         const transport = new SSEServerTransport("/mcp", res);
         
-        // CRITICAL: Start the transport FIRST
-        console.log("[MCP] Starting SSE transport...");
-        await transport.start();
-        console.log("[MCP] SSE transport started successfully");
-
-        // Setup close handler after transport is started
+        // Store BOTH the transport AND the server in the maps
+        activeTransports.set(sessionId, transport);
+        activeServers.set(sessionId, server);
+        console.log(`[MCP] Transport and server stored for session ${sessionId}`);
+        
+        // Setup close handler to clean up when connection closes
         res.on("close", () => {
-            console.log("[MCP] SSE connection closed by client");
+            console.log(`[MCP] SSE connection closed by client (Session: ${sessionId})`);
+            
+            // Remove from active maps
+            activeTransports.delete(sessionId);
+            activeServers.delete(sessionId);
+            console.log(`[MCP] Session ${sessionId} removed from active sessions`);
+            
             try {
                 transport.close();
             } catch (closeError) {
-                console.error("[MCP] Error closing transport:", closeError);
+                console.error(`[MCP] Error closing transport for session ${sessionId}:`, closeError);
             }
         });
 
-        // THEN connect the server to the transport
-        console.log("[MCP] Connecting MCP server to transport...");
-        await mcpServer.connect(transport);
-        console.log("[MCP] MCP server connected successfully");
+        // Set the session ID in the response header so the client can use it for POST requests
+        res.setHeader("Mcp-Session-Id", sessionId);
+        
+        // Connect THIS server to THIS transport
+        // NOTE: server.connect() automatically calls transport.start() internally
+        console.log(`[MCP] Connecting MCP server to transport (Session: ${sessionId})...`);
+        await server.connect(transport);
+        console.log(`[MCP] MCP server connected and transport started successfully (Session: ${sessionId})`);
+        console.log(`[MCP] Active sessions: ${activeTransports.size}`);
     } catch (error) {
-        console.error("[MCP] Error handling SSE connection:", error);
+        console.error(`[MCP] Error handling SSE connection (Session: ${sessionId}):`, error);
         if (error instanceof Error) {
             console.error("[MCP] Error stack:", error.stack);
         }
+        
+        // Clean up on error
+        activeTransports.delete(sessionId);
+        activeServers.delete(sessionId);
+        
         if (!res.headersSent) {
             res.status(500).json({
                 jsonrpc: "2.0",
@@ -211,18 +237,35 @@ app.get("/mcp", async (req: Request, res: Response) => {
 
 // Handle POST messages
 app.post("/mcp", async (req: Request, res: Response) => {
-    console.log("[MCP] Received POST message");
+    // Get the session ID from the request header
+    const sessionId = req.headers["mcp-session-id"] as string;
+    
+    console.log(`[MCP] Received POST message (Session: ${sessionId || "unknown"})`);
+    console.log(`[MCP] Active sessions: ${activeTransports.size}`);
+    console.log(`[MCP] Available session IDs: ${Array.from(activeTransports.keys()).join(", ")}`);
     
     try {
-        // Create a transport only for handling the POST message
-        // No need to connect the server again, it's already connected via GET
-        const transport = new SSEServerTransport("/mcp", res);
+        // Retrieve the transport for this session
+        const transport = activeTransports.get(sessionId);
         
-        console.log("[MCP] Processing POST message...");
+        if (!transport) {
+            console.error(`[MCP] No active transport found for session: ${sessionId}`);
+            res.status(400).json({
+                jsonrpc: "2.0",
+                error: {
+                    code: -32000,
+                    message: "Session not found. Please establish SSE connection first (GET /mcp)",
+                },
+                id: null,
+            });
+            return;
+        }
+        
+        console.log(`[MCP] Found transport for session ${sessionId}, processing message...`);
         await transport.handlePostMessage(req, res, req.body);
-        console.log("[MCP] POST message processed successfully");
+        console.log(`[MCP] POST message processed successfully for session ${sessionId}`);
     } catch (error) {
-        console.error("[MCP] Error handling MCP POST request:", error);
+        console.error(`[MCP] Error handling MCP POST request (Session: ${sessionId}):`, error);
         if (error instanceof Error) {
             console.error("[MCP] Error stack:", error.stack);
         }
