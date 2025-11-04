@@ -16,6 +16,7 @@ import { getPortalInfo, PortalInfo } from "./utils/portal-info.js";
 // Global variables for server state
 let portalInfo: PortalInfo;
 let enhancedTools: Tool[];
+let mcpServer: Server;
 
 // Enhanced tool with portal context
 function enhanceToolsWithPortalInfo(
@@ -33,8 +34,10 @@ function enhanceToolsWithPortalInfo(
     });
 }
 
-// Create a new MCP server instance
-function getServer(): Server {
+// Initialize a single MCP server instance
+function initializeServer(): Server {
+    console.log("[MCP] Initializing MCP server instance");
+    
     const server = new Server(
         {
             name: "opengov-mcp",
@@ -91,6 +94,7 @@ function getServer(): Server {
             const errorMessage = error instanceof Error
                 ? error.message
                 : String(error);
+            const errorStack = error instanceof Error ? error.stack : undefined;
 
             server.sendLoggingMessage({
                 level: "error",
@@ -100,6 +104,7 @@ function getServer(): Server {
                     arguments: args,
                     timestamp: new Date().toISOString(),
                     error: errorMessage,
+                    stack: errorStack,
                 },
             });
 
@@ -115,23 +120,34 @@ function getServer(): Server {
         tools: enhancedTools,
     }));
 
+    console.log("[MCP] Server instance initialized successfully");
     return server;
 }
 
 // Setup server configuration
 async function setupServer(): Promise<void> {
     try {
+        console.log("[MCP] Starting server setup...");
+        
         // Get information about the data portal
         portalInfo = await getPortalInfo();
+        console.log(`[MCP] Portal info retrieved: ${portalInfo.title}`);
 
         // Update tools list with portal info
         enhancedTools = enhanceToolsWithPortalInfo(SOCRATA_TOOLS, portalInfo);
+        console.log(`[MCP] Enhanced ${enhancedTools.length} tool(s) with portal info`);
+
+        // Initialize the global MCP server instance
+        mcpServer = initializeServer();
 
         console.log(
-            `OpenGov MCP Server configured for data portal: ${portalInfo.title}`,
+            `[MCP] OpenGov MCP Server configured for data portal: ${portalInfo.title}`,
         );
     } catch (error) {
-        console.error("Error during server setup:", error);
+        console.error("[MCP] Error during server setup:", error);
+        if (error instanceof Error) {
+            console.error("[MCP] Stack trace:", error.stack);
+        }
         throw error;
     }
 }
@@ -149,25 +165,43 @@ app.use(express.json());
 
 // Handle SSE connection (GET request)
 app.get("/mcp", async (req: Request, res: Response) => {
+    console.log("[MCP] New SSE connection request received");
+    
     try {
-        const server = getServer();
+        // Create the SSE transport
         const transport = new SSEServerTransport("/mcp", res);
+        
+        // CRITICAL: Start the transport FIRST
+        console.log("[MCP] Starting SSE transport...");
+        await transport.start();
+        console.log("[MCP] SSE transport started successfully");
 
+        // Setup close handler after transport is started
         res.on("close", () => {
-            console.log("SSE connection closed");
-            transport.close();
+            console.log("[MCP] SSE connection closed by client");
+            try {
+                transport.close();
+            } catch (closeError) {
+                console.error("[MCP] Error closing transport:", closeError);
+            }
         });
 
-        await server.connect(transport);
-        await transport.start();
+        // THEN connect the server to the transport
+        console.log("[MCP] Connecting MCP server to transport...");
+        await mcpServer.connect(transport);
+        console.log("[MCP] MCP server connected successfully");
     } catch (error) {
-        console.error("Error handling SSE connection:", error);
+        console.error("[MCP] Error handling SSE connection:", error);
+        if (error instanceof Error) {
+            console.error("[MCP] Error stack:", error.stack);
+        }
         if (!res.headersSent) {
             res.status(500).json({
                 jsonrpc: "2.0",
                 error: {
                     code: -32603,
                     message: "Internal server error",
+                    data: error instanceof Error ? error.message : String(error),
                 },
                 id: null,
             });
@@ -177,20 +211,28 @@ app.get("/mcp", async (req: Request, res: Response) => {
 
 // Handle POST messages
 app.post("/mcp", async (req: Request, res: Response) => {
+    console.log("[MCP] Received POST message");
+    
     try {
-        const server = getServer();
+        // Create a transport only for handling the POST message
+        // No need to connect the server again, it's already connected via GET
         const transport = new SSEServerTransport("/mcp", res);
-
-        await server.connect(transport);
+        
+        console.log("[MCP] Processing POST message...");
         await transport.handlePostMessage(req, res, req.body);
+        console.log("[MCP] POST message processed successfully");
     } catch (error) {
-        console.error("Error handling MCP POST request:", error);
+        console.error("[MCP] Error handling MCP POST request:", error);
+        if (error instanceof Error) {
+            console.error("[MCP] Error stack:", error.stack);
+        }
         if (!res.headersSent) {
             res.status(500).json({
                 jsonrpc: "2.0",
                 error: {
                     code: -32603,
                     message: "Internal server error",
+                    data: error instanceof Error ? error.message : String(error),
                 },
                 id: null,
             });
